@@ -34,6 +34,55 @@ bearish. Turning it on adds an *optional* directional check (`STRICT`
 rejects conflicting setups outright; `PREFERENCE` merely withholds the +10
 scoring bonus, never blocks the trade).
 
+## Tuned to how you actually trade
+
+The defaults below are calibrated to the trader's stated rules, not generic
+placeholders — everything stays a configurable input if you want to
+experiment, but this is the out-of-the-box behavior:
+
+* **Break** = a candle *closing* beyond a prior swing high/low. No extra
+  strength/momentum requirement beyond the close itself (`Minimum_Break_Distance`
+  is a tiny noise filter, not a strictness knob).
+* **Retest** = price simply returning into the tolerance zone around the
+  broken level, within a few bars (`Retest_Max_Bars = 5`) — no rejection
+  wick or extra confirmation required at the retest itself.
+* **Engulfing** must (a) fully engulf the previous candle's body **and**
+  (b) look like a genuinely strong, decisive candle relative to recent
+  price action — not just technically bigger than a tiny previous candle.
+  That second condition is `Engulfing_Min_Avg_Body_Ratio`, enforced whenever
+  `Use_Strict_Engulfing = true` (the default). A candle that fails either
+  check is not a "weak engulfing" that gets scored down — it simply isn't
+  recognized as an engulf yet, so the EA keeps watching the next couple of
+  bars (`Engulfing_Max_Bars_After_Retest`) before giving up on the setup.
+* **Entry** fires the instant the engulfing candle closes (`Entry_Mode =
+  CLOSED_CANDLE`, the default) — no waiting for a break of its high/low.
+* **Stop Loss** defaults to `SL_Method = SL_ENGULFING_WICK`: beyond the
+  engulfing candle's wick, plus `SL_Buffer_Points`.
+* **Take Profit** defaults to `TP_Method = TP_NEXT_STRUCTURE`: the EA scans
+  already-closed history for the nearest *unbroken* opposing swing high/low
+  (same fractal validity rules as break detection) or the previous day's
+  high/low, ahead of price in the trade direction, and aims there instead of
+  a fixed multiple. If no such level clears `TP_Min_Structure_RR` (default
+  1.0R) within `TP_Structure_Lookback_Bars`, it falls back to a fixed
+  `RiskReward` multiple of the realized SL distance, so every trade still
+  gets a valid TP.
+* **Liquidity sweeps and higher-timeframe bias are not part of your rule
+  set** — `Use_Liquidity_Filter` and `Use_HTF_Filter` stay off by default;
+  the corresponding scoring bonuses simply contribute 0 rather than gating
+  entries.
+* **Every timeframe, every session** — `Enable_M1` through `Enable_H4` are
+  all on and `Use_Session_Filter` is off by default. The same rule set
+  (same inputs) is applied independently and identically on every enabled
+  timeframe; nothing changes the logic between M1 and H4 except the bars
+  it's reading.
+
+Because the liquidity/HTF/displacement scoring bonuses are off in this
+configuration, `Minimum_Setup_Score` defaults to `60` rather than `70` — the
+realistic ceiling with only Break+Retest+Engulfing active is 80, so 60 stays
+selective (requires at least a moderate retest and a genuinely decisive
+engulf) without silently rejecting valid setups for bonus points you never
+asked for.
+
 ## Architecture
 
 The EA is organized into named modules mirroring the discretionary BREG
@@ -42,14 +91,14 @@ workflow, each implemented as its own function:
 | Module | Responsibility |
 |---|---|
 | `InitializeEA` | Builds the active timeframe list, creates ATR/MA indicator handles, configures `CTrade`, parses the manual news list. |
-| `DetectSwingStructure` / `FindSwingHigh` / `FindSwingLow` | Fractal swing detection with `Swing_Left_Bars`/`Swing_Right_Bars` confirmation and a `Minimum_Swing_Distance` prominence filter so noise isn't mistaken for structure. Adapts per timeframe because the same left/right/distance inputs are applied independently to each timeframe's own bar data. |
+| `DetectSwingStructure` / `FindSwingHigh` / `FindSwingLow` / `IsValidSwingHigh` / `IsValidSwingLow` | Fractal swing detection with `Swing_Left_Bars`/`Swing_Right_Bars` confirmation and a `Minimum_Swing_Distance` prominence filter so noise isn't mistaken for structure. Adapts per timeframe because the same left/right/distance inputs are applied independently to each timeframe's own bar data. The validity check is factored out so it can be reused by both break detection and TP structure-target scanning. |
 | `DetectBreak` / `ValidateBreak` / `CreateSetupFromBreak` | Confirms a **closed-bar** break beyond the swing level by at least `Minimum_Break_Distance` points (wicks alone never qualify), optionally requires displacement, records the break level/time, and opens a new `BregSetup` record. |
 | `DetectRetest` / `ValidateRetest` | Waits (up to `Retest_Max_Bars`) for price to return into a tolerance zone around the broken level (`Retest_Tolerance_Points`, bounded by `Retest_Min_Depth`/`Retest_Max_Depth`). A strong closed-bar push back through the level by more than the tolerance + `Retest_Invalidation_Buffer_Points` cancels the setup early. |
-| `DetectEngulfing` / `EvaluateEngulfing` / `CheckIntrabarEngulfing` | Confirms a full-body engulfing candle within `Engulfing_Max_Bars_After_Retest` bars of the retest. `Use_Strict_Engulfing` + `Engulfing_Min_Body_Ratio` gate the minimum body-size ratio. The intrabar variant re-runs the same check against the still-forming bar for `Entry_Mode = INTRABAR_AGGRESSIVE`. |
-| `CalculateSetupScore` | 0–110 point score: Break +30, Retest quality +5..+25, Engulfing quality +12..+25, HTF alignment +10, Liquidity sweep +10, Displacement +10. Setups below `Minimum_Setup_Score` are invalidated instead of traded. |
+| `DetectEngulfing` / `EvaluateEngulfing` / `CheckIntrabarEngulfing` | Confirms a full-body engulfing candle within `Engulfing_Max_Bars_After_Retest` bars of the retest. `Use_Strict_Engulfing` gates both `Engulfing_Min_Body_Ratio` (vs. the previous candle) and `Engulfing_Min_Avg_Body_Ratio` (vs. recent average candle size, filtering out "weak" engulfs). The intrabar variant re-runs the same check against the still-forming bar for `Entry_Mode = INTRABAR_AGGRESSIVE`. |
+| `CalculateSetupScore` | 0–110 point score: Break +30, Retest quality +5..+25, Engulfing quality +20..+25 (12 only reachable with `Use_Strict_Engulfing = false`), HTF alignment +10, Liquidity sweep +10, Displacement +10. Setups below `Minimum_Setup_Score` are invalidated instead of traded. |
 | `CheckHTFContext` | Optional HTF EMA/price bias check (see above). |
 | `CheckLiquidity` | Optional PDH/PDL, equal-highs/lows and wick-sweep detection feeding the scoring bonus only — never a hard filter. |
-| `CalculateStopLoss` / `CalculateTakeProfit` | Four SL placement modes (`STRUCTURE`, `ENGULFING_WICK`, `RETEST_SWING`, `ATR`) plus buffer; TP derived purely from the realized SL distance × `RiskReward`. |
+| `CalculateStopLoss` / `CalculateTakeProfit` / `FindNextTPTarget` | Four SL placement modes (`STRUCTURE`, `ENGULFING_WICK`, `RETEST_SWING`, `ATR`) plus buffer. TP defaults to the nearest qualifying opposing structure/liquidity level (`TP_NEXT_STRUCTURE`), falling back to `RiskReward` × realized SL distance when no level qualifies or `TP_Method = TP_FIXED_RR`. |
 | `CalculateLotSize` | Uses `SYMBOL_TRADE_TICK_VALUE`/`SYMBOL_TRADE_TICK_SIZE`/volume step-min-max from `SymbolInfoDouble` — no hard-coded per-symbol assumptions, works on any instrument. |
 | `CheckRiskLimits` / `CanOpenNewTrade` | Enforces `Max_Trades_Per_Day`, `Max_Open_Trades`, `Max_Consecutive_Losses`, and the `One_Trade_Total` vs `One_Trade_Per_Timeframe` policy (each timeframe trades under its own `MagicNumber + tfIndex`, which is what makes per-timeframe accounting possible). |
 | `CheckSpread` / `CheckSession` | Optional spread ceiling and London/New York/Asian session windows. |

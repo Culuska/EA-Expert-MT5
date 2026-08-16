@@ -12,7 +12,7 @@
 //| is opt-in.                                                         |
 //+------------------------------------------------------------------+
 #property copyright "BREG EA"
-#property version   "1.00"
+#property version   "1.10"
 #property description "Break-Retest-Engulfing multi-timeframe price action EA"
 
 #include <Trade\Trade.mqh>
@@ -38,6 +38,12 @@ enum ENUM_HTF_FILTER_MODE
 {
    HTF_MODE_STRICT,      // Reject setups that conflict with HTF bias
    HTF_MODE_PREFERENCE   // Reduce score only, never hard-reject
+};
+
+enum ENUM_TP_METHOD
+{
+   TP_NEXT_STRUCTURE,   // Nearest opposing swing/liquidity level beyond entry (falls back to fixed R:R)
+   TP_FIXED_RR          // Always entry + SL-distance * RiskReward
 };
 
 enum ENUM_PRIMARY_TF
@@ -79,7 +85,7 @@ input bool  Enable_M5                = true;
 input bool  Enable_M15               = true;
 input bool  Enable_M30               = true;
 input bool  Enable_H1                = true;
-input bool  Enable_H4                = false;
+input bool  Enable_H4                = true;
 input ENUM_PRIMARY_TF Primary_Timeframe = PRIMARY_AUTO;   // AUTO = scan all Enable_* timeframes
 input bool  Use_HTF_Filter           = false;             // Optional directional filter only
 input ENUM_TIMEFRAMES HTF_Timeframe  = PERIOD_H1;
@@ -95,15 +101,16 @@ input double Minimum_Break_Distance  = 2.0;    // points close must clear the le
 input int    Swing_Lookback_Bars     = 100;    // how far back to search for a valid swing
 
 input group "Retest Parameters"
-input int    Retest_Max_Bars                  = 10;
+input int    Retest_Max_Bars                  = 5;    // "a few bars" - keep tight, not a lingering setup
 input double Retest_Tolerance_Points           = 20;
 input double Retest_Min_Depth                  = 0;
 input double Retest_Max_Depth                  = 100;
 input double Retest_Invalidation_Buffer_Points = 30;   // extra buffer beyond tolerance before invalidation
 
 input group "Engulfing Confirmation"
-input bool   Use_Strict_Engulfing            = true;
-input double Engulfing_Min_Body_Ratio        = 1.0;
+input bool   Use_Strict_Engulfing            = true;   // full-body engulf AND a decisive/strong candle - not just "technically bigger"
+input double Engulfing_Min_Body_Ratio        = 1.0;    // engulfing body vs previous candle's body
+input double Engulfing_Min_Avg_Body_Ratio    = 1.2;    // engulfing body vs recent average body - filters out "weak" engulfing
 input int    Engulfing_Max_Bars_After_Retest = 3;
 
 input group "Entry Settings"
@@ -111,7 +118,7 @@ input ENUM_ENTRY_MODE Entry_Mode     = ENTRY_CLOSED_CANDLE;
 input int    InpSlippagePoints       = 20;
 
 input group "Setup Scoring"
-input double Minimum_Setup_Score     = 70;     // 0-110
+input double Minimum_Setup_Score     = 60;     // 0-110; ~60/80 with liquidity/HTF/displacement bonuses left off by default
 
 input group "Liquidity Filter (Optional)"
 input bool   Use_Liquidity_Filter              = false;
@@ -124,11 +131,14 @@ input double Minimum_Displacement_Ratio = 1.5;
 input int    Displacement_Lookback_Bars = 10;
 
 input group "Stop Loss & Take Profit"
-input ENUM_SL_METHOD SL_Method       = SL_STRUCTURE;
+input ENUM_SL_METHOD SL_Method       = SL_ENGULFING_WICK;  // beyond the engulfing candle's wick
 input double SL_Buffer_Points        = 50;
 input int    ATR_Period              = 14;
 input double ATR_Multiplier          = 1.5;
-input double RiskReward              = 3.0;
+input ENUM_TP_METHOD TP_Method       = TP_NEXT_STRUCTURE;  // target the next swing/liquidity level, not a fixed multiple
+input double TP_Min_Structure_RR     = 1.0;    // a structure target must clear at least this R:R, else fall back to fixed R:R
+input int    TP_Structure_Lookback_Bars = 150; // how far back to search for the next opposing swing/liquidity level
+input double RiskReward              = 3.0;    // used as the fallback target, and always when TP_Method = TP_FIXED_RR
 
 input group "Risk Management"
 input double Risk_Per_Trade          = 1.0;    // % of equity
@@ -474,36 +484,61 @@ double DetectSwingStructure(string sym, ENUM_TIMEFRAMES tf, ENUM_SETUP_DIR dir, 
       return FindSwingLow(sym, tf, startShift, Swing_Lookback_Bars, Swing_Left_Bars, Swing_Right_Bars, Minimum_Swing_Distance, swingTimeOut);
 }
 
+bool IsValidSwingHigh(string sym, ENUM_TIMEFRAMES tf, int s, int leftBars, int rightBars, double minDistPoints)
+{
+   double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+   if(s - rightBars < 1) return false;
+
+   double candidate = iHigh(sym, tf, s);
+   if(candidate <= 0) return false;
+
+   for(int L = 1; L <= leftBars; L++)
+   {
+      double h = iHigh(sym, tf, s + L);
+      if(h >= candidate || (candidate - h) < minDistPoints * point) return false;
+   }
+   for(int R = 1; R <= rightBars; R++)
+   {
+      double h = iHigh(sym, tf, s - R);
+      if(h >= candidate || (candidate - h) < minDistPoints * point) return false;
+   }
+   return true;
+}
+
+bool IsValidSwingLow(string sym, ENUM_TIMEFRAMES tf, int s, int leftBars, int rightBars, double minDistPoints)
+{
+   double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+   if(s - rightBars < 1) return false;
+
+   double candidate = iLow(sym, tf, s);
+   if(candidate <= 0) return false;
+
+   for(int L = 1; L <= leftBars; L++)
+   {
+      double l = iLow(sym, tf, s + L);
+      if(l <= candidate || (l - candidate) < minDistPoints * point) return false;
+   }
+   for(int R = 1; R <= rightBars; R++)
+   {
+      double l = iLow(sym, tf, s - R);
+      if(l <= candidate || (l - candidate) < minDistPoints * point) return false;
+   }
+   return true;
+}
+
 double FindSwingHigh(string sym, ENUM_TIMEFRAMES tf, int startShift, int maxLookback,
                       int leftBars, int rightBars, double minDistPoints, datetime &swingTimeOut)
 {
-   double point = SymbolInfoDouble(sym, SYMBOL_POINT);
    int bars = iBars(sym, tf);
    int limit = startShift + maxLookback;
    if(limit > bars - leftBars - 2) limit = bars - leftBars - 2;
 
    for(int s = startShift; s < limit; s++)
    {
-      if(s - rightBars < 1) continue;
-      double candidate = iHigh(sym, tf, s);
-      if(candidate <= 0) continue;
-
-      bool isHigh = true;
-      for(int L = 1; L <= leftBars && isHigh; L++)
-      {
-         double h = iHigh(sym, tf, s + L);
-         if(h >= candidate || (candidate - h) < minDistPoints * point) isHigh = false;
-      }
-      for(int R = 1; R <= rightBars && isHigh; R++)
-      {
-         double h = iHigh(sym, tf, s - R);
-         if(h >= candidate || (candidate - h) < minDistPoints * point) isHigh = false;
-      }
-
-      if(isHigh)
+      if(IsValidSwingHigh(sym, tf, s, leftBars, rightBars, minDistPoints))
       {
          swingTimeOut = iTime(sym, tf, s);
-         return candidate;
+         return iHigh(sym, tf, s);
       }
    }
    return 0.0;
@@ -512,36 +547,65 @@ double FindSwingHigh(string sym, ENUM_TIMEFRAMES tf, int startShift, int maxLook
 double FindSwingLow(string sym, ENUM_TIMEFRAMES tf, int startShift, int maxLookback,
                      int leftBars, int rightBars, double minDistPoints, datetime &swingTimeOut)
 {
-   double point = SymbolInfoDouble(sym, SYMBOL_POINT);
    int bars = iBars(sym, tf);
    int limit = startShift + maxLookback;
    if(limit > bars - leftBars - 2) limit = bars - leftBars - 2;
 
    for(int s = startShift; s < limit; s++)
    {
-      if(s - rightBars < 1) continue;
-      double candidate = iLow(sym, tf, s);
-      if(candidate <= 0) continue;
-
-      bool isLow = true;
-      for(int L = 1; L <= leftBars && isLow; L++)
-      {
-         double l = iLow(sym, tf, s + L);
-         if(l <= candidate || (l - candidate) < minDistPoints * point) isLow = false;
-      }
-      for(int R = 1; R <= rightBars && isLow; R++)
-      {
-         double l = iLow(sym, tf, s - R);
-         if(l <= candidate || (l - candidate) < minDistPoints * point) isLow = false;
-      }
-
-      if(isLow)
+      if(IsValidSwingLow(sym, tf, s, leftBars, rightBars, minDistPoints))
       {
          swingTimeOut = iTime(sym, tf, s);
-         return candidate;
+         return iLow(sym, tf, s);
       }
    }
    return 0.0;
+}
+
+//======================================================================
+// FindNextTPTarget - nearest opposing swing high/low or PDH/PDL beyond
+// the entry price, used for TP_Method = TP_NEXT_STRUCTURE. Only ever
+// looks at already-closed historical bars, so it stays non-repainting -
+// it is picking a pre-existing level to aim at, not predicting one.
+//======================================================================
+double FindNextTPTarget(string sym, ENUM_TIMEFRAMES tf, ENUM_SETUP_DIR dir, double refPrice)
+{
+   double best = 0.0;
+   int bars = iBars(sym, tf);
+   int limit = TP_Structure_Lookback_Bars;
+   if(limit > bars - Swing_Left_Bars - 2) limit = bars - Swing_Left_Bars - 2;
+
+   for(int s = 1; s < limit; s++)
+   {
+      if(dir == DIR_BULLISH)
+      {
+         if(!IsValidSwingHigh(sym, tf, s, Swing_Left_Bars, Swing_Right_Bars, Minimum_Swing_Distance)) continue;
+         double lvl = iHigh(sym, tf, s);
+         if(lvl > refPrice && (best == 0.0 || lvl < best)) best = lvl;
+      }
+      else
+      {
+         if(!IsValidSwingLow(sym, tf, s, Swing_Left_Bars, Swing_Right_Bars, Minimum_Swing_Distance)) continue;
+         double lvl = iLow(sym, tf, s);
+         if(lvl < refPrice && (best == 0.0 || lvl > best)) best = lvl;
+      }
+   }
+
+   if(iBars(sym, PERIOD_D1) >= 2)
+   {
+      if(dir == DIR_BULLISH)
+      {
+         double pdh = iHigh(sym, PERIOD_D1, 1);
+         if(pdh > refPrice && (best == 0.0 || pdh < best)) best = pdh;
+      }
+      else
+      {
+         double pdl = iLow(sym, PERIOD_D1, 1);
+         if(pdl < refPrice && (best == 0.0 || pdl > best)) best = pdl;
+      }
+   }
+
+   return best;
 }
 
 bool ValidateBreak(string sym, ENUM_TIMEFRAMES tf, ENUM_SETUP_DIR dir, double level, double &dispRatioOut)
@@ -716,6 +780,12 @@ bool EvaluateEngulfing(string sym, ENUM_TIMEFRAMES tf, int shift, ENUM_SETUP_DIR
 
    double ratio = body1 / body2;
    if(Use_Strict_Engulfing && ratio < Engulfing_Min_Body_Ratio) return false;
+
+   // "Strong, decisive candle" check: technically engulfing a tiny previous
+   // candle is not enough - the engulfing candle must also stand out against
+   // recent average candle size, or it is a weak engulf and does not qualify.
+   double avgBodyRatio = GetDisplacementRatio(sym, tf, shift);
+   if(Use_Strict_Engulfing && avgBodyRatio < Engulfing_Min_Avg_Body_Ratio) return false;
 
    setup.engulfOpen = open1; setup.engulfClose = close1;
    setup.engulfHigh = high1; setup.engulfLow = low1;
@@ -1001,12 +1071,34 @@ double CalculateStopLoss(int idx, const BregSetup &setup, double entryPrice)
    return NormalizeDouble(sl, digits);
 }
 
-double CalculateTakeProfit(ENUM_SETUP_DIR dir, double entry, double sl)
+double CalculateTakeProfit(int idx, ENUM_SETUP_DIR dir, double entry, double sl)
 {
-   double dist = MathAbs(entry - sl);
-   double tp = (dir == DIR_BULLISH) ? entry + dist * RiskReward : entry - dist * RiskReward;
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   return NormalizeDouble(tp, digits);
+   double dist = MathAbs(entry - sl);
+   double fixedRR_TP = (dir == DIR_BULLISH) ? entry + dist * RiskReward : entry - dist * RiskReward;
+
+   if(TP_Method == TP_FIXED_RR || dist <= 0)
+      return NormalizeDouble(fixedRR_TP, digits);
+
+   ENUM_TIMEFRAMES tf = g_tfArr[idx];
+   double target = FindNextTPTarget(_Symbol, tf, dir, entry);
+
+   if(target > 0)
+   {
+      double resultDist = MathAbs(target - entry);
+      double rr = resultDist / dist;
+      if(rr >= TP_Min_Structure_RR)
+      {
+         if(Debug_Mode) PrintFormat("[BREG][%s] TP set to next structure/liquidity level @ %.5f (R:R=%.2f)", g_tfNames[idx], target, rr);
+         return NormalizeDouble(target, digits);
+      }
+      if(Debug_Mode) PrintFormat("[BREG][%s] Nearest structure target @ %.5f only offers R:R=%.2f (< %.2f) - using fixed R:R instead",
+                                  g_tfNames[idx], target, rr, TP_Min_Structure_RR);
+   }
+   else if(Debug_Mode)
+      PrintFormat("[BREG][%s] No qualifying structure/liquidity target found - using fixed R:R", g_tfNames[idx]);
+
+   return NormalizeDouble(fixedRR_TP, digits);
 }
 
 double NormalizeVolume(double lot)
@@ -1221,7 +1313,7 @@ void ExecuteTrade(int idx, BregSetup &setup)
    double price = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
    double sl = CalculateStopLoss(idx, setup, price);
-   double tp = CalculateTakeProfit(setup.dir, price, sl);
+   double tp = CalculateTakeProfit(idx, setup.dir, price, sl);
 
    long stopLevelPts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
