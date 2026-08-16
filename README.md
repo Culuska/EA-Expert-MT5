@@ -17,6 +17,29 @@ File: [`MQL5/Experts/BREG/BREG_EA.mq5`](MQL5/Experts/BREG/BREG_EA.mq5)
    EA scans whichever timeframes you enable independently of the chart
    period.
 
+## Calibrated for XAUUSD (Gold)
+
+All "points" inputs (`SL_Buffer_Points`, `Retest_Tolerance_Points`,
+`Max_Spread_Points`, etc.) are calibrated for a typical **2-digit XAUUSD
+quote** (point = $0.01, e.g. `2650.23`), which is what most MT5 brokers use.
+A few brokers quote gold with 3 decimals instead — the same raw "points"
+input then means a different dollar amount.
+
+You don't have to guess which one your broker uses: with `Debug_Mode = true`,
+`OnInit` prints every points-based input converted into real price terms
+for whatever symbol is actually attached, e.g.:
+
+```
+[BREG] XAUUSD: Digits=2 Point=0.01
+[BREG]   SL_Buffer_Points             = 100 pts (~1.00)
+[BREG]   Max_Spread_Points            = 300 pts (~3.00)
+[BREG]   Current live spread          = 180 pts (~1.80)
+```
+
+Check that log line on first attach and adjust any input that doesn't
+match how you'd naturally describe that distance in dollars on your
+broker's chart.
+
 ## Why the EA is not "restricted" to any one timeframe
 
 `Enable_M1` … `Enable_H4` each independently turn a timeframe's BREG
@@ -234,10 +257,12 @@ sensible fixed-R:R fallback when the journal says so); lot size scales
 with `Risk_Per_Trade` and your test balance, not a fixed number.
 
 **Step 6 — Broker realism.** Set a realistic spread/commission model for
-your broker (Tester → symbol settings), and set `Max_Spread_Points` to
-something meaningful for the instrument (50 points is a placeholder,
-reasonable for a 5-digit FX major, likely wrong for gold/indices — you
-should tell me the instrument(s) you trade and I'll size this properly).
+your broker (Tester → symbol settings). `Max_Spread_Points = 300` (~$3.00)
+is a reasonable starting ceiling for XAUUSD on a 2-digit quote, but gold
+spreads vary a lot by broker/account type (raw ECN vs. standard) and blow
+out around rollover and high-impact news — watch the `Current live spread`
+line `LogPointConversions()` prints on attach against what you actually see
+on your broker's XAUUSD chart, and tighten or loosen accordingly.
 
 **Step 7 — Forward test on a demo account** for at least a few weeks
 before considering live capital, with `Debug_Mode = true` so you have a

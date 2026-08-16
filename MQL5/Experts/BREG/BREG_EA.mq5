@@ -12,7 +12,7 @@
 //| is opt-in.                                                         |
 //+------------------------------------------------------------------+
 #property copyright "BREG EA"
-#property version   "1.20"
+#property version   "1.21"
 #property description "Break-Retest-Engulfing multi-timeframe price action EA"
 
 #include <Trade\Trade.mqh>
@@ -96,16 +96,16 @@ input ENUM_MA_METHOD HTF_MA_Method   = MODE_EMA;
 input group "Swing & Structure Detection"
 input int    Swing_Left_Bars         = 3;
 input int    Swing_Right_Bars        = 3;
-input double Minimum_Swing_Distance  = 5.0;    // points of prominence required
-input double Minimum_Break_Distance  = 2.0;    // points close must clear the level by
+input double Minimum_Swing_Distance  = 100;    // points of prominence required (XAUUSD @ 2-digit: ~$1.00)
+input double Minimum_Break_Distance  = 20;     // points close must clear the level by (~$0.20)
 input int    Swing_Lookback_Bars     = 100;    // how far back to search for a valid swing
 
 input group "Retest Parameters"
 input int    Retest_Max_Bars                  = 5;    // "a few bars" - keep tight, not a lingering setup
-input double Retest_Tolerance_Points           = 20;
+input double Retest_Tolerance_Points           = 80;   // ~$0.80 on XAUUSD @ 2-digit
 input double Retest_Min_Depth                  = 0;
-input double Retest_Max_Depth                  = 100;
-input double Retest_Invalidation_Buffer_Points = 30;   // extra buffer beyond tolerance before invalidation
+input double Retest_Max_Depth                  = 400;  // ~$4.00 on XAUUSD @ 2-digit
+input double Retest_Invalidation_Buffer_Points = 150;  // ~$1.50 on XAUUSD @ 2-digit
 
 input group "Engulfing Confirmation"
 input bool   Use_Strict_Engulfing            = true;   // full-body engulf AND a decisive/strong candle - not just "technically bigger"
@@ -115,7 +115,7 @@ input int    Engulfing_Max_Bars_After_Retest = 3;
 
 input group "Entry Settings"
 input ENUM_ENTRY_MODE Entry_Mode     = ENTRY_CLOSED_CANDLE;
-input int    InpSlippagePoints       = 20;
+input int    InpSlippagePoints       = 50;     // ~$0.50 on XAUUSD @ 2-digit
 
 input group "Setup Scoring"
 input double Minimum_Setup_Score     = 60;     // 0-110; ~60/80 with liquidity/HTF/displacement bonuses left off by default
@@ -123,7 +123,7 @@ input double Minimum_Setup_Score     = 60;     // 0-110; ~60/80 with liquidity/H
 input group "Liquidity Filter (Optional)"
 input bool   Use_Liquidity_Filter              = false;
 input int    Liquidity_Lookback_Bars           = 20;
-input double Liquidity_Equal_Tolerance_Points  = 10;
+input double Liquidity_Equal_Tolerance_Points  = 50;   // ~$0.50 on XAUUSD @ 2-digit
 
 input group "Displacement Filter (Optional)"
 input bool   Use_Displacement_Filter    = false;
@@ -132,7 +132,7 @@ input int    Displacement_Lookback_Bars = 10;
 
 input group "Stop Loss & Take Profit"
 input ENUM_SL_METHOD SL_Method       = SL_ENGULFING_WICK;  // beyond the engulfing candle's wick
-input double SL_Buffer_Points        = 50;
+input double SL_Buffer_Points        = 100;    // ~$1.00 on XAUUSD @ 2-digit
 input int    ATR_Period              = 14;
 input double ATR_Multiplier          = 1.5;
 input ENUM_TP_METHOD TP_Method       = TP_NEXT_STRUCTURE;  // target the next swing/liquidity level, not a fixed multiple
@@ -167,7 +167,7 @@ input int    Session_Asian_End       = 9;
 
 input group "Spread Filter"
 input bool   Use_Spread_Filter       = true;
-input int    Max_Spread_Points       = 50;
+input int    Max_Spread_Points       = 300;    // ~$3.00 on XAUUSD @ 2-digit - check your broker's typical live spread and tune
 
 input group "News Filter (Optional / Manual)"
 input bool   Use_News_Filter          = false;
@@ -388,9 +388,36 @@ bool InitializeEA()
       string list = "";
       for(int k = 0; k < g_tfCount; k++) list += g_tfNames[g_activeTfList[k]] + " ";
       PrintFormat("[BREG] EA initialized on %s. Active timeframes: %s", _Symbol, list);
+      LogPointConversions();
    }
 
    return true;
+}
+
+//======================================================================
+// LogPointConversions - every "points" input, converted to real price
+// terms for whatever symbol/digit convention is actually attached. Point
+// size is not standardized across brokers for instruments like gold
+// (2-digit vs 3-digit quoting), so this makes the effective SL/TP/spread
+// distances self-evident on startup instead of silently assumed.
+//======================================================================
+void LogPointConversions()
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   PrintFormat("[BREG] %s: Digits=%d Point=%s", _Symbol, digits, DoubleToString(point, digits));
+   PrintFormat("[BREG]   Minimum_Swing_Distance      = %.0f pts (~%s)", Minimum_Swing_Distance, DoubleToString(Minimum_Swing_Distance * point, digits));
+   PrintFormat("[BREG]   Minimum_Break_Distance       = %.0f pts (~%s)", Minimum_Break_Distance, DoubleToString(Minimum_Break_Distance * point, digits));
+   PrintFormat("[BREG]   Retest_Tolerance_Points      = %.0f pts (~%s)", Retest_Tolerance_Points, DoubleToString(Retest_Tolerance_Points * point, digits));
+   PrintFormat("[BREG]   Retest_Max_Depth             = %.0f pts (~%s)", Retest_Max_Depth, DoubleToString(Retest_Max_Depth * point, digits));
+   PrintFormat("[BREG]   Retest_Invalidation_Buffer   = %.0f pts (~%s)", Retest_Invalidation_Buffer_Points, DoubleToString(Retest_Invalidation_Buffer_Points * point, digits));
+   PrintFormat("[BREG]   SL_Buffer_Points             = %.0f pts (~%s)", SL_Buffer_Points, DoubleToString(SL_Buffer_Points * point, digits));
+   PrintFormat("[BREG]   Max_Spread_Points            = %.0f pts (~%s)", Max_Spread_Points, DoubleToString(Max_Spread_Points * point, digits));
+   PrintFormat("[BREG]   InpSlippagePoints            = %.0f pts (~%s)", InpSlippagePoints, DoubleToString(InpSlippagePoints * point, digits));
+   PrintFormat("[BREG]   Current live spread          = %d pts (~%s)", (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD),
+               DoubleToString(SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * point, digits));
+   Print("[BREG] If any of the above look wrong for how you actually see this instrument quoted, adjust the corresponding input - do not assume these defaults are correct for every broker.");
 }
 
 void BuildActiveTFList()
