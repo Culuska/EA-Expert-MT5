@@ -156,6 +156,34 @@ each timeframe owns an independent `BregSetup` and magic sub-number, an M1
 BUY, an M5 BUY and an H1 BUY can all be genuinely independent trades (subject
 to `One_Trade_Total` / `One_Trade_Per_Timeframe` and the other risk caps).
 
+## Production hardening (technical, not trading decisions)
+
+These are handled automatically and require no trading input from you:
+
+* **Margin validation** (`ClampLotToFreeMargin`) — the risk-based lot size is
+  checked against `OrderCalcMargin` before sending. If free margin can't
+  support the full risk-sized lot, it's scaled down (with a small safety
+  buffer) rather than blindly sent and rejected; if even the broker minimum
+  lot isn't affordable, the setup is invalidated with a clear log line
+  instead of silently failing.
+* **Broker trade-mode awareness** (`CheckSymbolTradeMode`) — respects
+  `SYMBOL_TRADE_MODE_DISABLED`/`CLOSEONLY`/`LONGONLY`/`SHORTONLY` (some
+  brokers flip these around rollover, high-impact news, or low-liquidity
+  hours). A SELL setup is simply skipped during a long-only window rather
+  than erroring out.
+* **Order-failure recovery** (`SendOrderWithRecovery`) — a requote or
+  "price changed" re-prices against the current market and retries exactly
+  once; "invalid stops" widens SL/TP by one extra stop-level increment and
+  retries exactly once. Anything else (including a second failure) is left
+  as `ENTRY_READY` and naturally retried on the next tick through the same
+  spread/news/session gates — except `TRADE_RETCODE_NO_MONEY`, which
+  invalidates the setup outright since retrying won't change the margin
+  situation.
+* **Dashboard refresh throttling** (`Dashboard_Refresh_Seconds`, default 1s)
+  — chart-object updates and `ChartRedraw` calls are time-throttled instead
+  of firing on every tick, which matters on M1 in live trading or during
+  tick-heavy Strategy Tester runs.
+
 ## Backtesting notes
 
 Every input that shapes swing/retest/engulfing behaviour
@@ -164,3 +192,69 @@ Every input that shapes swing/retest/engulfing behaviour
 timeframe can — and should — be optimized separately in the Strategy
 Tester. A parameter set tuned for H1 structure will typically be far too
 loose for M1 noise and vice versa; nothing in the EA assumes otherwise.
+
+## Testing & validation procedure
+
+**Step 1 — Compile.** Open the file in MetaEditor and press F7. Fix any
+compile errors shown (there shouldn't be any — this was written and
+statically reviewed carefully, but MetaEditor's compiler is the real,
+final check; I don't have one available in this environment).
+
+**Step 2 — Visual single-timeframe pass.** In Strategy Tester, pick one
+symbol, set `Enable_M1..Enable_H4` so only one timeframe is on, model
+"Every tick based on real ticks" (most accurate), a date range with a few
+weeks of data, and tick "Visual mode." Watch the chart objects appear in
+the right order — BOS line, then RETEST text, then ENGULFING text, then
+the BUY/SELL arrow with dotted SL/TP lines — and read the `Debug_Mode`
+journal log alongside it. Confirm the sequence never jumps ahead of the
+candle currently closing (that would indicate a repaint bug — it shouldn't
+happen here, since every decision reads `shift >= 1`, but this is the way
+to catch it if something regresses).
+
+**Step 3 — Repeat per timeframe.** Do step 2 once per timeframe you intend
+to trade (M1, M5, M15, M30, H1, H4 — independently, not all at once yet).
+Expect very different trade *frequency* and win/loss character between
+them; that's normal and expected, not a bug — an M1 parameter set is
+inherently noisier than an H1 one even with the exact same rules, per the
+project's own assumption that no single tuning generalizes across
+timeframes.
+
+**Step 4 — Multi-timeframe pass.** Re-enable all the timeframes you plan
+to run live simultaneously and re-run the same range. Watch the dashboard
+panel to confirm each timeframe really is progressing through its own
+state independently (e.g. M1 sitting in `WAITING_FOR_ENGULFING` while H1
+is still `IDLE`). Check `One_Trade_Total` vs `One_Trade_Per_Timeframe`
+behaves as expected for your account size.
+
+**Step 5 — Sanity-check trade mechanics.** For a handful of individual
+trades, right-click → "trade properties" (or check the journal line) and
+manually verify: SL sits beyond the engulfing candle's wick by
+`SL_Buffer_Points`; TP sits at the nearest structure/liquidity level (or a
+sensible fixed-R:R fallback when the journal says so); lot size scales
+with `Risk_Per_Trade` and your test balance, not a fixed number.
+
+**Step 6 — Broker realism.** Set a realistic spread/commission model for
+your broker (Tester → symbol settings), and set `Max_Spread_Points` to
+something meaningful for the instrument (50 points is a placeholder,
+reasonable for a 5-digit FX major, likely wrong for gold/indices — you
+should tell me the instrument(s) you trade and I'll size this properly).
+
+**Step 7 — Forward test on a demo account** for at least a few weeks
+before considering live capital, with `Debug_Mode = true` so you have a
+full journal trail to review setups against your own chart reading.
+
+## Production-readiness checklist
+
+| Item | Status |
+|---|---|
+| Compiles without errors | Statically reviewed line-by-line (brace/paren balance, every function call resolved, every signature checked against MQL5 documentation); **please confirm with an actual F7 compile** — no MQL5 compiler is available in this environment. |
+| Function signatures | Verified against MQL5/CTrade documentation. |
+| Symbol properties | Lot sizing, SL/TP, and margin checks all read live `SymbolInfoDouble`/`SymbolInfoInteger` — nothing hard-coded per-symbol. |
+| Volume normalization | `NormalizeVolume()` respects `SYMBOL_VOLUME_MIN/MAX/STEP`. |
+| Stop-level requirements | Enforced in `ExecuteTrade` via `SYMBOL_TRADE_STOPS_LEVEL` before sending. |
+| Trading permissions | `MQL_TRADE_ALLOWED` / `TERMINAL_TRADE_ALLOWED` / `ACCOUNT_TRADE_ALLOWED` / `SYMBOL_TRADE_MODE` all checked. |
+| Duplicate entries | Each setup carries a unique ID and is reset the instant it trades or invalidates; forward-only state machine. |
+| Multi-timeframe logic | Independent `BregSetup` + magic sub-number per timeframe. |
+| Strategy Tester compatibility | Non-repainting design (closed-bar only) is what makes tester results meaningful; see steps above. |
+| Margin / free-margin validation | `ClampLotToFreeMargin` + `OrderCalcMargin`. |
+| Order-failure handling | `SendOrderWithRecovery` (bounded retry on requote/invalid-stops), no-money hard-stops the setup. |

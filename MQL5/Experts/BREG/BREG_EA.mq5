@@ -12,7 +12,7 @@
 //| is opt-in.                                                         |
 //+------------------------------------------------------------------+
 #property copyright "BREG EA"
-#property version   "1.10"
+#property version   "1.20"
 #property description "Break-Retest-Engulfing multi-timeframe price action EA"
 
 #include <Trade\Trade.mqh>
@@ -178,6 +178,7 @@ input string News_Event_Times          = "";  // comma separated "YYYY.MM.DD HH:
 input group "Visual Interface"
 input bool   Show_Chart_Objects        = true;
 input bool   Show_Dashboard            = true;
+input int    Dashboard_Refresh_Seconds = 1;      // throttle redraws on fast tick streams (M1/backtest)
 input bool   Keep_Invalidated_Drawings = false;
 input bool   Enable_Alerts             = false;
 input bool   Enable_Push_Notifications = false;
@@ -238,6 +239,7 @@ int             g_dailyTradeCount   = 0;
 int             g_currentDay        = -1;
 
 datetime        g_newsTimes[];
+uint            g_lastDashboardUpdateMs = 0;
 
 //======================================================================
 // LIFECYCLE
@@ -286,7 +288,16 @@ void OnTick()
    }
 
    ManageTrade();
-   if(Show_Dashboard) DrawDashboard();
+
+   if(Show_Dashboard)
+   {
+      uint now = GetTickCount();
+      if(now - g_lastDashboardUpdateMs >= (uint)MathMax(Dashboard_Refresh_Seconds, 0) * 1000)
+      {
+         g_lastDashboardUpdateMs = now;
+         DrawDashboard();
+      }
+   }
 }
 
 void OnTradeTransaction(const MqlTradeTransaction &trans,
@@ -1303,13 +1314,15 @@ void ExecuteTrade(int idx, BregSetup &setup)
       if(Debug_Mode) Print("[BREG] Trading not allowed (terminal/account/EA permissions)");
       return;
    }
-   if((ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED)
+
+   bool isBuy = (setup.dir == DIR_BULLISH);
+
+   if(!CheckSymbolTradeMode(isBuy))
    {
-      if(Debug_Mode) Print("[BREG] Symbol trading disabled");
+      InvalidateSetup(idx, setup, "Symbol trade mode does not permit this direction right now");
       return;
    }
 
-   bool isBuy = (setup.dir == DIR_BULLISH);
    double price = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
    double sl = CalculateStopLoss(idx, setup, price);
@@ -1344,12 +1357,18 @@ void ExecuteTrade(int idx, BregSetup &setup)
       return;
    }
 
+   lot = ClampLotToFreeMargin(isBuy, price, lot);
+   if(lot <= 0)
+   {
+      if(Debug_Mode) Print("[BREG] Insufficient free margin for even the minimum lot, aborting trade");
+      InvalidateSetup(idx, setup, "Insufficient free margin");
+      return;
+   }
+
    trade.SetExpertMagicNumber(InpMagicNumber + idx);
 
-   bool ok;
    string cmt = StringSubstr(setup.id, 0, MathMin(StringLen(setup.id), 31));
-   if(isBuy) ok = trade.Buy(lot, _Symbol, price, sl, tp, cmt);
-   else      ok = trade.Sell(lot, _Symbol, price, sl, tp, cmt);
+   bool ok = SendOrderWithRecovery(isBuy, lot, price, sl, tp, cmt, digits);
 
    if(ok)
    {
@@ -1368,8 +1387,107 @@ void ExecuteTrade(int idx, BregSetup &setup)
    }
    else
    {
-      if(Debug_Mode) PrintFormat("[BREG][%s] Order failed. Retcode=%d %s", g_tfNames[idx], trade.ResultRetcode(), trade.ResultRetcodeDescription());
+      uint retcode = trade.ResultRetcode();
+      if(Debug_Mode) PrintFormat("[BREG][%s] Order failed. Retcode=%d %s", g_tfNames[idx], retcode, trade.ResultRetcodeDescription());
+
+      if(retcode == TRADE_RETCODE_NO_MONEY)
+         InvalidateSetup(idx, setup, "Broker rejected order: insufficient margin");
+      // Any other failure (requote, invalid stops, connection hiccup, etc.) is left as
+      // ENTRY_READY and simply retried on the next tick by the OnTick loop, up to the
+      // normal spread/news/session gates above.
    }
+}
+
+//======================================================================
+// CheckSymbolTradeMode - respects broker-side long-only/short-only/close-only states
+//======================================================================
+bool CheckSymbolTradeMode(bool isBuy)
+{
+   ENUM_SYMBOL_TRADE_MODE mode = (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
+   switch(mode)
+   {
+      case SYMBOL_TRADE_MODE_DISABLED:
+      case SYMBOL_TRADE_MODE_CLOSEONLY:
+         if(Debug_Mode) Print("[BREG] Symbol trading disabled or close-only right now");
+         return false;
+      case SYMBOL_TRADE_MODE_LONGONLY:
+         if(!isBuy && Debug_Mode) Print("[BREG] Symbol is long-only right now - SELL setup skipped");
+         return isBuy;
+      case SYMBOL_TRADE_MODE_SHORTONLY:
+         if(isBuy && Debug_Mode) Print("[BREG] Symbol is short-only right now - BUY setup skipped");
+         return !isBuy;
+      default:
+         return true; // SYMBOL_TRADE_MODE_FULL
+   }
+}
+
+//======================================================================
+// ClampLotToFreeMargin - risk-based lot size must still be affordable
+//======================================================================
+double ClampLotToFreeMargin(bool isBuy, double price, double lot)
+{
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double marginRequired = 0;
+   ENUM_ORDER_TYPE orderType = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
+   if(!OrderCalcMargin(orderType, _Symbol, lot, price, marginRequired))
+      return lot; // couldn't compute (rare) - let the broker be the final judge on send
+
+   if(marginRequired <= freeMargin) return lot;
+
+   double volMin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double minMargin = 0;
+   if(!OrderCalcMargin(orderType, _Symbol, volMin, price, minMargin) || minMargin > freeMargin)
+      return 0; // can't even afford the minimum lot
+
+   // Scale down proportionally, then re-normalize to a valid step
+   double scaled = lot * (freeMargin / marginRequired) * 0.98; // small safety buffer
+   double reduced = NormalizeVolume(scaled);
+   if(reduced < volMin) reduced = volMin;
+
+   if(Debug_Mode) PrintFormat("[BREG] Lot reduced from %.2f to %.2f - insufficient free margin for full risk-sized lot", lot, reduced);
+   return reduced;
+}
+
+//======================================================================
+// SendOrderWithRecovery - one bounded retry for transient/fixable failures
+//======================================================================
+bool SendOrderWithRecovery(bool isBuy, double lot, double price, double sl, double tp, string cmt, int digits)
+{
+   bool ok = isBuy ? trade.Buy(lot, _Symbol, price, sl, tp, cmt)
+                    : trade.Sell(lot, _Symbol, price, sl, tp, cmt);
+   if(ok) return true;
+
+   uint retcode = trade.ResultRetcode();
+
+   if(retcode == TRADE_RETCODE_REQUOTE || retcode == TRADE_RETCODE_PRICE_CHANGED)
+   {
+      // Re-price against the current market and try exactly once more.
+      double freshPrice = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double shift = freshPrice - price;
+      double newSl = NormalizeDouble(sl + shift, digits);
+      double newTp = NormalizeDouble(tp + shift, digits);
+      if(Debug_Mode) Print("[BREG] Requote/price-changed - retrying once at fresh market price");
+      return isBuy ? trade.Buy(lot, _Symbol, freshPrice, newSl, newTp, cmt)
+                   : trade.Sell(lot, _Symbol, freshPrice, newSl, newTp, cmt);
+   }
+
+   if(retcode == TRADE_RETCODE_INVALID_STOPS)
+   {
+      // Widen SL/TP by one extra stop-level increment and try exactly once more.
+      long stopLevelPts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+      double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      double extra = MathMax((double)stopLevelPts, 10.0) * point;
+      double newSl = isBuy ? sl - extra : sl + extra;
+      double newTp = isBuy ? tp + extra : tp - extra;
+      newSl = NormalizeDouble(newSl, digits);
+      newTp = NormalizeDouble(newTp, digits);
+      if(Debug_Mode) Print("[BREG] Invalid stops - widening SL/TP and retrying once");
+      return isBuy ? trade.Buy(lot, _Symbol, price, newSl, newTp, cmt)
+                   : trade.Sell(lot, _Symbol, price, newSl, newTp, cmt);
+   }
+
+   return false; // any other failure is left to the caller (no further retry here)
 }
 
 //======================================================================
