@@ -1,0 +1,9 @@
+# MetaTrader 5 compiled/generated artifacts
+*.ex5
+*.log
+*.bak
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
